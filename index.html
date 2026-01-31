@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Memory Theater - Raycast Focus</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #ffffff; font-family: sans-serif; }
+        
+        /* Sleek UI */
+        .top-bar {
+            position: absolute; top: 25px; left: 30px; z-index: 100;
+            display: flex; align-items: center; gap: 20px;
+        }
+        #upload-btn {
+            padding: 12px 30px; background: #000; color: white; 
+            border: none; border-radius: 12px; cursor: pointer; 
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1); font-weight: 600;
+        }
+        #file-input { display: none; }
+        #status-msg { font-size: 11px; color: #888; font-weight: bold; text-transform: uppercase; letter-spacing: 1.5px; }
+
+        /* PREVIEW WINDOW (Target 75% screen) */
+        #preview-container {
+            position: absolute; bottom: 50px; left: 50%; 
+            width: 400px; height: 250px; 
+            background: #000; border-radius: 20px;
+            border: 6px solid #1a1a1a; box-shadow: 0 50px 100px rgba(0,0,0,0.4);
+            overflow: hidden; z-index: 100; display: none;
+            transform: translateX(-50%) scale(1);
+            transform-origin: bottom center;
+            transition: transform 0.1s linear;
+            pointer-events: none;
+        }
+        #preview-img { width: 100%; height: 100%; object-fit: cover; }
+
+        /* Hand Feedback */
+        #hand-indicator {
+            position: fixed; top: 25px; right: 30px; width: 120px; height: 90px;
+            border-radius: 15px; background: #000; transform: scaleX(-1); border: 1px solid #ddd;
+        }
+        
+        #empty-state {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; color: #eee; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="top-bar">
+        <button id="upload-btn" onclick="document.getElementById('file-input').click()">Upload Memories</button>
+        <div id="status-msg">System Active</div>
+    </div>
+    
+    <input type="file" id="file-input" multiple accept="image/*">
+
+    <div id="empty-state">
+        <h1 style="font-size: 5rem; margin:0; letter-spacing: -2px; color:#f0f0f0;">2024</h1>
+    </div>
+
+    <div id="preview-container">
+        <img id="preview-img" src="">
+    </div>
+
+    <video id="hand-indicator"></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // Configuration
+        const theaterRadius = 10;
+        const cols = 6; 
+        const imgWidth = 3.2; 
+        const imgHeight = 2.0;
+        const padding = 0.15;
+
+        let theaterGroup = new THREE.Group();
+        let currentScale = 1;
+        const textureLoader = new THREE.TextureLoader();
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2(0, 0); // Always center for raycasting
+
+        // Three.js Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xffffff);
+        const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        scene.add(theaterGroup);
+        camera.position.set(0, 0, 0.1); 
+
+        async function buildTheater(urls) {
+            document.getElementById('empty-state').style.display = 'none';
+            while(theaterGroup.children.length > 0) theaterGroup.remove(theaterGroup.children[0]);
+
+            const textures = await Promise.all(urls.map(url => textureLoader.loadAsync(url)));
+            const angularWidth = (imgWidth / theaterRadius); 
+
+            textures.forEach((tex, i) => {
+                const row = Math.floor(i / cols);
+                const col = i % cols;
+                const totalRows = Math.ceil(textures.length / cols);
+
+                const angle = (col - (cols - 1) / 2) * (angularWidth + 0.05);
+                const geometry = new THREE.CylinderGeometry(
+                    theaterRadius, theaterRadius, imgHeight, 32, 1, true, 
+                    -angularWidth / 2, angularWidth
+                );
+                const material = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+                const mesh = new THREE.Mesh(geometry, material);
+                
+                mesh.rotation.y = angle + Math.PI; 
+                mesh.position.y = (row - (totalRows - 1) / 2) * -(imgHeight + padding);
+                mesh.userData.url = urls[i];
+                theaterGroup.add(mesh);
+            });
+            document.getElementById('preview-container').style.display = 'block';
+        }
+
+        document.getElementById('file-input').onchange = (e) => {
+            const urls = Array.from(e.target.files).map(f => URL.createObjectURL(f));
+            buildTheater(urls);
+        };
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8 });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const hand = results.multiHandLandmarks[0];
+                
+                // 1. PINCH LOGIC
+                const thumb = hand[4];
+                const index = hand[8];
+                const rawDist = Math.sqrt(Math.pow(thumb.x - index.x, 2) + Math.pow(thumb.y - index.y, 2));
+
+                const zoomThreshold = 0.22;
+                let targetScale = 1.0;
+
+                if (rawDist > zoomThreshold) {
+                    const maxScale = (window.innerWidth * 0.75) / 400;
+                    targetScale = 1.0 + (rawDist - zoomThreshold) * (maxScale * 4);
+                    targetScale = Math.min(targetScale, maxScale);
+                }
+
+                currentScale += (targetScale - currentScale) * 0.2;
+                document.getElementById('preview-container').style.transform = `translateX(-50%) scale(${currentScale})`;
+
+                // 2. HIGH SENSITIVITY NAVIGATION
+                if (currentScale < 1.1) {
+                    const x = hand[9].x; 
+                    const y = hand[9].y;
+                    
+                    // High multipliers for effortless movement
+                    const targetRotY = (x - 0.5) * -4.0; 
+                    const targetCameraY = (0.5 - y) * 15; 
+
+                    theaterGroup.rotation.y += (targetRotY - theaterGroup.rotation.y) * 0.1;
+                    camera.position.y += (targetCameraY - camera.position.y) * 0.1;
+                }
+                
+                // 3. RAYCAST FOCUS (The Fix)
+                updateRaycastFocus();
+            }
+        });
+
+        function updateRaycastFocus() {
+            // Point raycaster from camera center
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(theaterGroup.children);
+
+            if (intersects.length > 0) {
+                const focusedMesh = intersects[0].object;
+                const previewImg = document.getElementById('preview-img');
+                
+                // Only update if it's a new image to save performance
+                if (previewImg.src !== focusedMesh.userData.url) {
+                    previewImg.src = focusedMesh.userData.url;
+                }
+            }
+        }
+
+        const mediapipeCamera = new Camera(document.getElementById('hand-indicator'), {
+            onFrame: async () => { await hands.send({image: document.getElementById('hand-indicator')}); },
+            width: 640, height: 480
+        });
+        mediapipeCamera.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
